@@ -78,50 +78,52 @@ class Graph:
     def degree(self, node: object) -> float:
         """Weighted degree, with the self-loop counted **twice**.
 
-        This is the convention modularity requires: the degree must equal the number of edge endpoints at the
-        node, and a self-loop contributes two endpoints. Getting it wrong makes the modularity of an
-        aggregated graph differ from the partition it represents, and Louvain then optimises a quantity that
-        drifts at every level.
+        This is the convention modularity requires: the degree must count edge endpoints at the node, and a
+        self-loop contributes two. Getting it wrong makes the modularity of an aggregated graph differ from
+        the partition it represents, and Louvain then optimises a quantity that drifts at every level.
         """
         edges = self._adjacency[node]
         return sum(edges.values()) + edges.get(node, 0.0)
 
     def total_weight(self) -> float:
-        """``m``: the total edge weight, so that ``sum of degrees = 2m``."""
+        """``m``: total edge weight, defined so that ``sum of degrees = 2m``."""
         return sum(self.degree(node) for node in self._adjacency) / 2.0
 
     def edges(self) -> "list[tuple[object, object, float]]":
-        seen: set[tuple[object, object]] = set()
+        """Each undirected edge once, self-loops included."""
         output = []
+        seen: set[object] = set()
         for node, neighbours in self._adjacency.items():
             for other, weight in neighbours.items():
-                key = (node, other) if str(node) <= str(other) else (other, node)
-                if key in seen:
-                    continue
-                seen.add(key)
+                if other in seen and other != node:
+                    continue  # already emitted from the other endpoint
                 output.append((node, other, weight))
+            seen.add(node)
         return output
 
     def subgraph(self, nodes: "set[object]") -> "Graph":
         result = Graph()
         for node in nodes:
             result.add_node(node)
+        emitted: set[object] = set()
         for node in nodes:
             for other, weight in self._adjacency[node].items():
-                if other in nodes and (str(node) <= str(other)):
+                if other in nodes and (other not in emitted or other == node):
                     result.add_edge(node, other, weight)
+            emitted.add(node)
         return result
 
     def density(self, nodes: "set[object]") -> float:
-        """Internal edge count over the possible count: the first thing to ask about a candidate ring."""
+        """Internal edge count over the possible count: the first thing to ask of a candidate ring."""
         if len(nodes) < 2:
             return 0.0
-        internal = sum(
-            1
-            for node in nodes
-            for other in self._adjacency[node]
-            if other in nodes and other != node and str(node) < str(other)
-        )
+        internal = 0
+        seen: set[object] = set()
+        for node in nodes:
+            for other in self._adjacency[node]:
+                if other in nodes and other != node and other not in seen:
+                    internal += 1
+            seen.add(node)
         possible = len(nodes) * (len(nodes) - 1) / 2
         return internal / possible
 
@@ -132,7 +134,7 @@ class Graph:
 
 
 class UnionFind:
-    """Union by size with full path compression: near-linear components, and the baseline to beat."""
+    """Union by size with path compression: near-linear components, and the baseline to beat."""
 
     def __init__(self) -> None:
         self.parent: dict[object, object] = {}
@@ -148,7 +150,7 @@ class UnionFind:
         root = item
         while self.parent[root] != root:
             root = self.parent[root]
-        while self.parent[item] != root:  # path compression, iterative to avoid recursion limits
+        while self.parent[item] != root:  # iterative compression: no recursion limit to hit
             self.parent[item], item = root, self.parent[item]
         return root
 
@@ -208,7 +210,7 @@ class HeteroGraph:
         return sorted(self.links)
 
     def holders(self) -> "dict[str, set[str]]":
-        """Attribute -> the accounts sharing it. The inverted index the projection needs."""
+        """Attribute -> accounts sharing it: the inverted index the projection needs."""
         output: dict[str, set[str]] = {}
         for account, attributes in self.links.items():
             for attribute in attributes:
@@ -223,7 +225,7 @@ class HeteroGraph:
         biggest = sorted(sizes.items(), key=lambda item: item[1], reverse=True)[:5]
         lines = [
             f"{len(self.links)} accounts, {len(sizes)} shared attributes",
-            "largest attributes (these are the ones that decide the projection):",
+            "largest attributes (these decide what the projection looks like):",
         ]
         for attribute, size in biggest:
             pairs = size * (size - 1) // 2
@@ -232,6 +234,30 @@ class HeteroGraph:
                 f"  -> {pairs:>10,} account pairs"
             )
         return "\n".join(lines)
+
+
+def shared_attributes(
+    hetero: HeteroGraph, max_attribute_size: int | None = 50
+) -> "dict[tuple[str, str], list[str]]":
+    """Every account pair that shares at least one *admissible* attribute, and which ones.
+
+    Computing this once is what makes all three weightings correct: each pair is weighted from exactly the
+    attributes that survived the size cap, with no double counting and no dividing back out afterwards.
+    Attributes above the cap are dropped here, before any pair is formed, which is also the only reason this
+    is tractable -- a 4,000-account attribute would otherwise generate eight million pairs to weigh.
+    """
+    pairs: dict[tuple[str, str], list[str]] = {}
+    for attribute, accounts in hetero.holders().items():
+        size = len(accounts)
+        if size < 2:
+            continue
+        if max_attribute_size is not None and size > max_attribute_size:
+            continue
+        ordered = sorted(accounts)
+        for index, first in enumerate(ordered):
+            for second in ordered[index + 1 :]:
+                pairs.setdefault((first, second), []).append(attribute)
+    return pairs
 
 
 def project(
@@ -244,74 +270,57 @@ def project(
 
     ``weighting``:
 
-    * ``"count"`` -- one unit per shared attribute. The naive projection, kept because being able to
-      reproduce the failure is the point.
-    * ``"idf"`` -- each shared attribute contributes ``log(N / n_attribute)``, so evidence is weighted by
-      how unlikely the coincidence is. Two accounts sharing a card nobody else uses get a large weight; two
-      accounts sharing an airport wifi IP get one close to zero.
-    * ``"jaccard"`` -- the weight is the Jaccard similarity of the two accounts' attribute sets, which
-      normalises by how many attributes each account has. Useful when accounts differ wildly in how much
-      data they carry.
+    * ``"count"`` -- one unit per shared attribute. The naive projection, kept because reproducing the
+      failure is the point of having it.
+    * ``"idf"`` -- each shared attribute contributes ``log(N / n_attribute)``, so evidence is priced by how
+      unlikely the coincidence is. Two accounts sharing a card nobody else uses get a large weight; two
+      sharing an airport wifi IP get one near zero.
+    * ``"jaccard"`` -- the similarity of the two accounts' admissible attribute sets, which normalises by how
+      much data each account carries. Prefer it when accounts differ wildly in that respect, since otherwise
+      a heavily-instrumented account looks suspicious merely for having many attributes.
 
-    ``max_attribute_size`` drops attributes above a size, before any weighting. This is not an optimisation;
-    it is a modelling statement -- an IP address with 4,000 accounts behind it is infrastructure, not
-    evidence, and the quadratic edge count it produces will dominate everything if it is kept. IDF weighting
-    alone shrinks those edges but does not remove them, and enough near-zero edges still merge communities.
-
-    The two mechanisms are complementary and both are needed; ``python -m fraudgraph.cli components`` shows
-    what each one does on its own.
+    ``max_attribute_size`` drops attributes above a size before any pair is formed. This is not an
+    optimisation, it is a modelling statement: an IP address with 4,000 accounts behind it is infrastructure,
+    not evidence. IDF weighting alone shrinks those edges without removing them, and enough near-zero edges
+    still merge communities, so the two mechanisms are complementary and both are needed.
+    ``python -m fraudgraph.cli components`` shows what each does on its own.
     """
     if weighting not in {"count", "idf", "jaccard"}:
         raise ValueError("weighting must be 'count', 'idf' or 'jaccard'")
 
-    holders = hetero.holders()
+    sizes = hetero.attribute_sizes()
     total_accounts = max(len(hetero.links), 1)
     graph = Graph()
     for account in hetero.accounts:
         graph.add_node(account)
 
-    for attribute, accounts in holders.items():
-        size = len(accounts)
-        if size < 2:
-            continue
-        if max_attribute_size is not None and size > max_attribute_size:
-            continue
+    for (first, second), attributes in shared_attributes(hetero, max_attribute_size).items():
         if weighting == "count":
-            weight = 1.0
+            weight = float(len(attributes))
         elif weighting == "idf":
-            weight = math.log(total_accounts / size)
-            if weight <= 0.0:
-                continue  # an attribute held by every account carries no information at all
+            weight = sum(math.log(total_accounts / sizes[attribute]) for attribute in attributes)
         else:
-            weight = 1.0  # Jaccard is computed pairwise below
-
-        ordered = sorted(accounts)
-        for index, first in enumerate(ordered):
-            for second in ordered[index + 1 :]:
-                if weighting == "jaccard":
-                    left, right = hetero.links[first], hetero.links[second]
-                    value = len(left & right) / len(left | right)
-                else:
-                    value = weight
-                if value > min_weight:
-                    graph.add_edge(first, second, value)
-
-    if weighting == "jaccard":
-        # Pairwise Jaccard is computed once per shared attribute, so an edge accumulates a multiple of the
-        # true similarity. Divide it back out rather than leaving a quantity that is not what it claims.
-        for first, second, accumulated in graph.edges():
-            left, right = hetero.links[first], hetero.links[second]
-            shared = len(left & right)
-            if shared > 1:
-                graph._adjacency[first][second] = accumulated / shared
-                graph._adjacency[second][first] = accumulated / shared
+            admissible_first = {
+                attribute
+                for attribute in hetero.links[first]
+                if max_attribute_size is None or sizes[attribute] <= max_attribute_size
+            }
+            admissible_second = {
+                attribute
+                for attribute in hetero.links[second]
+                if max_attribute_size is None or sizes[attribute] <= max_attribute_size
+            }
+            union = admissible_first | admissible_second
+            weight = len(admissible_first & admissible_second) / len(union) if union else 0.0
+        if weight > min_weight:
+            graph.add_edge(first, second, weight)
     return graph
 
 
 def projection_report(hetero: HeteroGraph) -> str:
-    """Compare projections side by side: the edge count, the giant component, and what that costs."""
-    lines = [f"{'projection':<34}{'edges':>12}{'largest component':>20}{'share of accounts':>20}"]
-    lines.append("-" * len(lines[0]))
+    """Compare projections side by side: edge count, giant component, and what that costs."""
+    header = f"{'projection':<34}{'edges':>12}{'largest component':>20}{'share of accounts':>20}"
+    lines = [header, "-" * len(header)]
     total = len(hetero.accounts)
     for label, kwargs in (
         ("count, no cap (naive)", {"weighting": "count", "max_attribute_size": None}),
@@ -322,7 +331,5 @@ def projection_report(hetero: HeteroGraph) -> str:
         graph = project(hetero, **kwargs)
         components = connected_components(graph)
         largest = len(components[0]) if components else 0
-        lines.append(
-            f"{label:<34}{len(graph.edges()):>12,}{largest:>20,}{largest / total:>19.1%}"
-        )
+        lines.append(f"{label:<34}{len(graph.edges()):>12,}{largest:>20,}{largest / total:>19.1%}")
     return "\n".join(lines)
