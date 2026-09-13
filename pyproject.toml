@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graph-fraud-ring-detection-community"
+version = "1.0.0"
+description = "IDF-weighted bipartite projection, Louvain modularity optimisation, and analyst-queue evaluation for fraud ring detection, written from scratch"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Raghav Banuni" }]
+keywords = ["fraud-detection", "community-detection", "louvain", "modularity", "graph-analytics"]
+classifiers = [
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
+# No runtime dependencies. networkx and python-louvain are the right tools for production work; the point
+# here is the projection and the objective, which a library call hides.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+fraudgraph-demo = "fraudgraph.cli:main"
+
+[tool.setuptools]
+packages = ["fraudgraph"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]
